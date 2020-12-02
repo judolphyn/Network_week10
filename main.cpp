@@ -57,11 +57,12 @@ bool packet_analysis(const u_char* packet, const char* pattern, int len){
 	/* payload parse */
 	payload = (u_char *)(packet + SIZE_ETHERNET + size_ip + size_tcp);
 	int payload_len = len - (SIZE_ETHERNET + size_ip + size_tcp);
-	printf("   * Payload len is %d\n\n", payload_len);
-	if (payload_len <= 0) {
+	if (payload_len == 0) {
+		printf("   * Payload len is 0\n");
 		return false;
 	}
-	
+	printf("   * Payload len is %d!!\n",payload_len);
+
 	/* pattern matching */
 	int pattern_len = strlen(pattern);
 	int i;
@@ -98,7 +99,7 @@ u_short tcp_checksum(u_char* ip_header, u_char* tcp_header, int message_len){
 	}
 	u_short chk = sum >> 16 ;
 	chk = chk + sum & 0xffff;
-	return ~chk;
+	return chk ^ 0xffff;
 } 
 
 void tcp_block(pcap_t* handle, const u_char* packet, const char* pattern, int len){
@@ -109,16 +110,16 @@ void tcp_block(pcap_t* handle, const u_char* packet, const char* pattern, int le
 	
 	u_int size_ip;
 	u_int size_tcp;
-	int i, j;
+	int payload_len;
 
 	ethernet = (struct sniff_ethernet*)(packet);
-	
 	ip = (struct sniff_ip*)(packet + SIZE_ETHERNET);
 	size_ip = IP_HL(ip)*4;
 	tcp = (struct sniff_tcp*)(packet + SIZE_ETHERNET + size_ip);
 	size_tcp = TH_OFF(tcp)*4;
+	payload_len = len - (SIZE_ETHERNET + size_ip + size_tcp);
 
-	// foward packet.
+	// 1. foward packet.
 	u_char* foward_packet;
 	foward_packet = (u_char*)malloc(54);
 	memset(foward_packet,0,54);
@@ -127,19 +128,18 @@ void tcp_block(pcap_t* handle, const u_char* packet, const char* pattern, int le
 	memcpy(foward_packet,ethernet,14);
 
 	// ip header 
-	memcpy(foward_packet+14,ip,20);
+	memcpy(foward_packet+14,ip,20); // just copy.
 	struct sniff_ip* foward_ip = (sniff_ip*)((u_char*)foward_packet+14);
-	*((char*)foward_ip) = 0x45;
-	foward_ip->ip_len = htons(40);
-
+	*((char*)foward_ip) = 0x45; //version 4, ip header length : 20/4 = 5
+	foward_ip->ip_len = htons(40); //ip+tcp length is 40.
 	foward_ip->ip_sum = 0;
 	foward_ip->ip_sum = ip_checksum((u_char*)foward_ip);
 	
 	//tcp header
 	memcpy(foward_packet+34,tcp,20);
 	struct sniff_tcp* foward_tcp = (sniff_tcp*)((u_char*)foward_packet+34);
-
-	foward_tcp->th_flags = 0x04;
+	foward_tcp->th_flags = 0x14;
+	foward_tcp->th_seq = foward_tcp->th_seq + ntohl(payload_len); //seq + orgin.data.len
 	foward_tcp->th_sum = 0;
 	foward_tcp->th_sum = tcp_checksum((u_char*)foward_ip, (u_char*)foward_tcp, 0);
 
@@ -147,36 +147,37 @@ void tcp_block(pcap_t* handle, const u_char* packet, const char* pattern, int le
 	if (res != 0) printf("send foward packet Error!!\n");
 
 
-
-	// backward packet.
+	// 2. backward packet.
 	u_char* backward_packet;
 	backward_packet = (u_char*)malloc(65);
 	memset(backward_packet,0,65);
 	
 	// ethernet header
 	memcpy(backward_packet,ethernet,14);
-	memcpy(backward_packet,ethernet+6,6); //dmac to smac
+	memcpy(backward_packet,(u_char *)ethernet+6,6); //dmac to origin.smac
 
 	// ip header 
 	memcpy(backward_packet+14,ip,20);
-	memcpy(backward_packet+14+12,ip+16,4); //sip to dip
-	memcpy(backward_packet+14+16,ip+12,4); //dip to sip
-
+	memcpy(backward_packet+14+12,(u_char*)ip+16,4); //sip to origin.dip
+	memcpy(backward_packet+14+16,(u_char*)ip+12,4); //dip to origin.sip
 	struct sniff_ip* backward_ip = (sniff_ip*)((u_char*)backward_packet+14);
 	*((char*)backward_ip) = 0x45;
 	backward_ip->ip_len = htons(51); //40+11
-
+	backward_ip->ip_ttl = 128; //ttl set 128.
 	backward_ip->ip_sum = 0;
 	backward_ip->ip_sum = ip_checksum((u_char*)backward_ip);
 	
 	//tcp header
 	memcpy(backward_packet+34,tcp,20);
-	memcpy(backward_packet+34,tcp+2,2); //sport to dport
-	memcpy(backward_packet+34+2,tcp,2); //dport to sport
+	memcpy(backward_packet+34,(u_char*)tcp+2,2); //sport to origin.dport
+	memcpy(backward_packet+34+2,tcp,2); //dport to origin.sport
 	memcpy(backward_packet+54,"blocked!!!",11);
 	struct sniff_tcp* backward_tcp = (sniff_tcp*)((u_char*)backward_packet+34);
+	backward_tcp->th_flags = 0x11;
 
-	backward_tcp->th_flags = 0x01;
+	int temp = backward_tcp->th_ack;
+	backward_tcp->th_ack = backward_tcp->th_seq + ntohl(payload_len); //seq + orgin.data.len
+	backward_tcp->th_seq = temp;
 	backward_tcp->th_sum = 0;
 	backward_tcp->th_sum = tcp_checksum((u_char*)backward_ip,(u_char*)backward_tcp,11);
 
@@ -209,11 +210,11 @@ int main(int argc, char* argv[]) {
             printf("pcap_next_ex return %d(%s)\n", res, pcap_geterr(handle));
             break;
         }
+
         if (packet_analysis(packet,pattern,header->caplen)){
-        	printf("wow it's great!\n\n\n\n");
+        	printf("Pattern Matched. \n\n\n\n");
         	tcp_block(handle,packet,pattern,header->caplen);
         }
-        printf("packet check complete\n\n\n");
     }
     pcap_close(handle);
 
